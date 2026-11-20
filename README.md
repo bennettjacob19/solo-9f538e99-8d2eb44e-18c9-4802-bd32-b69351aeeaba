@@ -64,6 +64,8 @@ docker compose up --build
 - 交互式文档与上传表单：`http://localhost:8000/docs`
 - 健康检查：`GET http://localhost:8000/healthz`
 - compose 已设置 `mem_limit: 256m` 硬内存上限。
+- 急件抢占同样在该 256 MiB 上限内完成：任一时刻只有一张图占用计算位，
+  让位发生在块边界且该块缓冲已释放。
 
 ### 本地运行
 
@@ -82,7 +84,8 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 浏览器打开 `/docs`，在 `POST /segment` 表单中分别上传：
 
 - `image`：单通道 uint8、二维 `.npy` 图像文件；
-- `params`：上述模型参数 JSON 文件。
+- `params`：上述模型参数 JSON 文件；
+- `urgent`（可选，默认未勾选）：急件开关，见下节「急件（复拍小图）」。
 
 ### curl
 
@@ -95,6 +98,31 @@ curl -X POST http://localhost:8000/segment \
 
 返回体即 uint8 `.npy` 掩膜（`Content-Disposition: attachment; filename=mask.npy`）。
 整张图处理完毕后才会返回响应。
+
+### 急件（复拍小图）
+
+`POST /segment` 表单新增可选字段 `urgent`（布尔，默认 `false`；原调用方式不变）：
+
+```bash
+curl -X POST http://localhost:8000/segment \
+  -F "image=@reshot.npy;type=application/octet-stream" \
+  -F "params=@params.json;type=application/json" \
+  -F "urgent=true" \
+  --output mask.npy
+```
+
+- **尺寸限制**：急件的宽、高各不得超过 **1024 像素**（`H <= 1024` 且 `W <= 1024`），
+  超限返回 HTTP 400（`detail` 说明实际尺寸）；校验在上传落盘后、进入计算前完成，
+  被拒绝的急件不会中断或拖慢正在运行的常规单。
+- **抢占时机**：当常规单尚未让过位、仍有块未算，且已有校验通过的急件在排队时，
+  常规单写完当前块、释放该块计算缓冲后立刻交棒；两层（第一层与第二层）都以
+  块边界作为交棒点，最后一层最后一块写完后掩膜已完整，不再交棒。
+- **接手顺序**：急件按受理顺序（FIFO）依次独占计算位；常规单在交棒瞬间已受理的
+  急件全部完成后**立刻续算**，沿用磁盘上已写好的中间特征图与掩膜块，不重算已有块。
+- **让位上限**：每张常规单中途最多让位一次，之后到达的急件排在它后面。
+- **失败处理**：急件计算失败时该请求返回错误（400/500），常规单照常续算不受影响。
+- **一致性**：任一时刻只有一张图占用计算位；交棒只发生在块边界，中间结果全部
+  落盘，因此常规单续算与一次跑完、以及各急件单独运行，结果均**逐像素一致**。
 
 ### Python
 
@@ -119,6 +147,8 @@ mask = np.load(io.BytesIO(r.content))  # uint8, 取值 {0,1}
 |------|--------|
 | 图像不是合法 `.npy` / dtype 非 uint8 / 非二维 / 为空 | 400 |
 | 参数 JSON 非法、结构不符、含 NaN/Infinity | 400 |
+| 急件（`urgent=true`）宽或高超过 1024 像素 | 400 |
+| `urgent` 字段不是合法布尔值 | 422 |
 | 上传体积超过 `MAX_UPLOAD_BYTES`（默认 2 GiB） | 413 |
 | 推理过程发生未预期错误 | 500 |
 
@@ -145,6 +175,10 @@ pytest -q
 - 分块推理 vs 整图参考在 1×1 到 257×255、奇偶尺寸、不同分块大小下逐像素相等；
 - 图边/角的零填充行为、严格 `>0` 阈值、单热像素感受野；
 - 参数与输入的全部校验分支；
+- 急件尺寸限制、`/docs` 表单字段、原上传方式兼容；
+- 单计算位互斥、急件按受理顺序接手、常规单最多让位一次、交棒后从已写块续算、
+  急件失败不阻塞常规单、超限急件不打断常规单（含并发真实推理端到端）；
+- 在每个块边界调用交棒钩子后结果仍与整图逐像素相等；
 - FastAPI 端到端上传、错误码、`/docs` 可用性。
 
 整图参考实现见 `app/inference.py::reference_full_inference`。
@@ -155,8 +189,9 @@ pytest -q
 ```
 app/
   inference.py   # DiskArray 磁盘分块数组、两层 tiled 卷积、整图参考实现
+  scheduler.py   # 单计算位调度：急件抢占、常规单让位一次后原地续算
   main.py        # FastAPI 路由、上传流式落盘、校验与错误处理
-tests/           # 正确性与 HTTP 端到端测试
+tests/           # 正确性、调度策略与 HTTP 端到端测试
 scripts/
   bench_large.py # 大尺寸内存/耗时基准
 Dockerfile

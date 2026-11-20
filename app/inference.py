@@ -26,6 +26,7 @@ import ast
 import json
 import os
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
@@ -312,11 +313,20 @@ def tiled_segment(
     intermediate_path: str,
     output_path: str,
     tile: int = DEFAULT_TILE,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[int, int]:
     """Run tiled inference and write the mask as a uint8 ``.npy`` file.
 
     Returns ``(out_h, out_w)``. The mask has shape
     ``(ceil(H/2), ceil(W/2))`` and dtype uint8 with values in {0, 1}.
+
+    ``checkpoint`` is invoked after every tile of either layer has been
+    written and its temporary buffers released (except for the very last
+    tile of the run, when the mask is already complete).  It may block (e.g.
+    to hand the compute slot to an urgent job) and then returns; the
+    intermediate feature map and the partial mask on disk make the run
+    resumable at that exact tile boundary, so the result is bit-identical
+    either way.
     """
     if tile < 1:
         raise ValueError("tile size must be >= 1")
@@ -330,12 +340,24 @@ def tiled_segment(
 
         feat = DiskArray(intermediate_path, np.float32, (h1, w1), create=True)
         try:
-            _run_layer1(image, feat, layer1, tile)
+            run = _layer1_tiles(image, feat, layer1, tile)
+            if checkpoint is None:
+                for _ in run:
+                    pass
+            else:
+                for _ in run:
+                    checkpoint()
             feat.flush()
 
             mask = DiskArray(output_path, np.uint8, (h2, w2), create=True)
             try:
-                _run_layer2(feat, mask, layer2, tile)
+                run = _layer2_tiles(feat, mask, layer2, tile)
+                if checkpoint is None:
+                    for _ in run:
+                        pass
+                else:
+                    for _ in run:
+                        checkpoint()
                 mask.flush()
             finally:
                 mask.close()
@@ -347,10 +369,10 @@ def tiled_segment(
     return h2, w2
 
 
-def _run_layer1(
+def _layer1_tiles(
     image: DiskArray, feat: DiskArray, layer: ConvLayer, tile: int
-) -> None:
-    """Stride-2 3x3 conv + ReLU, tiled over the layer-1 output grid.
+):
+    """Stride-2 3x3 conv + ReLU, yielding after each written tile.
 
     Each output tile materialises only the small padded input region it
     needs (zeros outside the image), reproducing global one-ring padding.
@@ -395,12 +417,16 @@ def _run_layer1(
             # Persist this tile immediately; only one tile is ever resident.
             feat.write_tile(oy0, ox0, out)
             del local, out
+            # Tile on disk and buffers dropped: safe hand-over point. Layer 2
+            # has not started yet, so even the last layer-1 tile is a valid
+            # place to let an urgent job in.
+            yield
 
 
-def _run_layer2(
+def _layer2_tiles(
     feat: DiskArray, mask: DiskArray, layer: ConvLayer, tile: int
-) -> None:
-    """Stride-1 3x3 conv on the layer-1 feature map, thresholded to {0, 1}.
+):
+    """Stride-1 3x3 conv on the layer-1 feature map, yielding per tile.
 
     A one-output-pixel halo is loaded around every tile so that the same
     feature values are read as in a whole-image convolution; seams between
@@ -443,6 +469,11 @@ def _run_layer2(
             out += b
             mask.write_tile(oy0, ox0, (out > 0).astype(np.uint8))
             del local, out
+            # Tile on disk and buffers dropped: safe hand-over point. The
+            # very last tile of the whole run is not a hand-over point: the
+            # mask is complete, so there is nothing left to resume.
+            if oy1 < h1 or ox1 < w1:
+                yield
 
 
 # ---------------------------------------------------------------------------

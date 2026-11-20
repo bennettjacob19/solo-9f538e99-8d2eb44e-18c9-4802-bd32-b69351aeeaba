@@ -89,6 +89,52 @@ def test_different_tile_sizes_agree():
         assert np.array_equal(_run_tiled(image, layers, tile), ref)
 
 
+@pytest.mark.parametrize("tile", [1, 3, 8, 512])
+def test_checkpoint_per_tile_keeps_result_identical(tmp_path, tile):
+    """A hand-over hook at every tile boundary must not change any pixel."""
+    rng = np.random.default_rng(11)
+    image = rng.integers(0, 256, size=(37, 45), dtype=np.uint8)
+    layers = _make_layers(seed=4)
+    img_path = tmp_path / "in.npy"
+    np.save(img_path, image)
+    calls = []
+
+    def hook():
+        calls.append(1)
+
+    tiled_segment(
+        str(img_path), layers,
+        str(tmp_path / "f.npy"), str(tmp_path / "o.npy"),
+        tile=tile, checkpoint=hook,
+    )
+    got = np.load(tmp_path / "o.npy")
+    assert np.array_equal(got, reference_full_inference(image, layers))
+    h1, w1 = (image.shape[0] + 1) // 2, (image.shape[1] + 1) // 2
+    # Checks after every tile of layer 1, plus every layer-2 tile except the
+    # last one (the mask is complete there, so there is nothing to resume).
+    expected_calls = (
+        len(range(0, h1, tile)) * len(range(0, w1, tile))
+        + len(range(0, h1, tile)) * len(range(0, w1, tile)) - 1
+    )
+    assert len(calls) == expected_calls
+
+
+def test_checkpoint_exception_aborts_and_is_not_swallowed(tmp_path):
+    image = np.zeros((8, 8), dtype=np.uint8)
+    img_path = tmp_path / "in.npy"
+    np.save(img_path, image)
+
+    def hook():
+        raise RuntimeError("budget exhausted")
+
+    with pytest.raises(RuntimeError):
+        tiled_segment(
+            str(img_path), _make_layers(),
+            str(tmp_path / "f.npy"), str(tmp_path / "o.npy"),
+            tile=2, checkpoint=hook,
+        )
+
+
 def test_borders_see_zero_padding_only():
     # All-zero image with a bias pattern: layer1 bias 1 -> all ReLU outputs 1;
     # layer2 sums the 3x3 ones-kernel over padded feat -> interior 9, border 6,
